@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "/Users/bhavanishanker/RAG_Tutorial/.venv/bin/python",
+  "python.analysis.venvPath": "/Users/bhavanishanker/RAG_Tutorial",
+  "python.analysis.venv": ".venv",
+  "python.analysis.extraPaths": [
+    "/Users/bhavanishanker/RAG_Tutorial/.venv/lib/python3.14/site-packages"
+  ]
+}
