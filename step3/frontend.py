@@ -7,20 +7,14 @@ BACKEND_URL = "http://localhost:8000"
 def render_sources(sources: list) -> None:
     for i, src in enumerate(sources):
         with st.expander(f"Source {i + 1} — {src['source']} (chunk {src['chunk_index']})"):
-            # Confidence score
             pct = src.get("similarity_pct", 0)
             st.caption(f"Relevance: {pct}%")
             st.progress(pct / 100)
 
-            # Highlighted sentence inside the chunk
             chunk_text = src.get("text", "")
-            highlight = src.get("highlight", "")
-            if highlight and highlight.strip() in chunk_text:
-                marked = chunk_text.replace(
-                    highlight.strip(),
-                    f"**{highlight.strip()}**",
-                    1,
-                )
+            highlight = src.get("highlight", "").strip()
+            if highlight and highlight in chunk_text:
+                marked = chunk_text.replace(highlight, f"**{highlight}**", 1)
                 st.markdown(marked)
             else:
                 st.markdown(chunk_text)
@@ -50,6 +44,11 @@ with st.sidebar:
     st.header("Upload a PDF")
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
 
+    st.subheader("Chunking settings")
+    chunk_size = st.slider("Chunk size (chars)", min_value=200, max_value=3000, value=1000, step=100)
+    chunk_overlap = st.slider("Chunk overlap (chars)", min_value=0, max_value=500, value=200, step=50)
+    top_k = st.slider("Top-K results", min_value=1, max_value=10, value=5)
+
     if uploaded_file is not None:
         if st.button("Ingest PDF"):
             with st.spinner("Ingesting..."):
@@ -57,9 +56,12 @@ with st.sidebar:
                     response = requests.post(
                         f"{BACKEND_URL}/ingest",
                         files={"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")},
+                        params={"chunk_size": chunk_size, "chunk_overlap": chunk_overlap},
                     )
                     if response.status_code == 200:
-                        st.success(response.json()["message"])
+                        data = response.json()
+                        st.success(data["message"])
+                        st.caption(f"chunk_size={data['chunk_size']}, overlap={data['chunk_overlap']}")
                     else:
                         st.error(f"Error: {response.json().get('detail', 'Unknown error')}")
                 except requests.exceptions.ConnectionError:
@@ -115,7 +117,7 @@ if prompt := st.chat_input("Ask a question about your PDF..."):
             try:
                 response = requests.post(
                     f"{BACKEND_URL}/ask",
-                    json={"query": prompt},
+                    json={"query": prompt, "top_k": top_k},
                     timeout=30,
                 )
                 if response.status_code == 200:
