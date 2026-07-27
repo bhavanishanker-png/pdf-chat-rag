@@ -3,10 +3,49 @@ import requests
 
 BACKEND_URL = "http://localhost:8000"
 
+
+def render_sources(sources: list) -> None:
+    for i, src in enumerate(sources):
+        with st.expander(f"Source {i + 1} — {src['source']} (chunk {src['chunk_index']})"):
+            # Confidence score
+            pct = src.get("similarity_pct", 0)
+            st.caption(f"Relevance: {pct}%")
+            st.progress(pct / 100)
+
+            # Highlighted sentence inside the chunk
+            chunk_text = src.get("text", "")
+            highlight = src.get("highlight", "")
+            if highlight and highlight.strip() in chunk_text:
+                marked = chunk_text.replace(
+                    highlight.strip(),
+                    f"**{highlight.strip()}**",
+                    1,
+                )
+                st.markdown(marked)
+            else:
+                st.markdown(chunk_text)
+
+
+def format_chat_as_text(messages: list) -> str:
+    lines = []
+    for msg in messages:
+        role = "You" if msg["role"] == "user" else "AI"
+        lines.append(f"{role}: {msg['content']}")
+        if msg.get("sources"):
+            lines.append("  Sources:")
+            for src in msg["sources"]:
+                lines.append(
+                    f"    - {src['source']} chunk {src['chunk_index']} "
+                    f"(relevance {src.get('similarity_pct', '?')}%)"
+                )
+        lines.append("")
+    return "\n".join(lines)
+
+
 st.set_page_config(page_title="PDF RAG Chat", layout="wide")
 st.title("PDF RAG Chat")
 
-# --- Sidebar: PDF upload and DB stats ---
+# --- Sidebar ---
 with st.sidebar:
     st.header("Upload a PDF")
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
@@ -27,12 +66,32 @@ with st.sidebar:
                     st.error("Could not reach the backend. Is it running on port 8000?")
 
     st.divider()
-    st.subheader("Database status")
+    st.subheader("Database")
     try:
         health = requests.get(f"{BACKEND_URL}/", timeout=2).json()
         st.metric("Chunks stored", health.get("chunks_in_db", 0))
     except Exception:
         st.warning("Backend not reachable")
+
+    if st.button("Clear DB", type="secondary"):
+        try:
+            res = requests.post(f"{BACKEND_URL}/clear", timeout=5)
+            if res.status_code == 200:
+                st.success("Database cleared")
+            else:
+                st.error("Failed to clear database")
+        except requests.exceptions.ConnectionError:
+            st.error("Could not reach the backend")
+
+    st.divider()
+    if st.session_state.get("messages"):
+        chat_text = format_chat_as_text(st.session_state["messages"])
+        st.download_button(
+            label="Download Chat (.txt)",
+            data=chat_text,
+            file_name="chat_history.txt",
+            mime="text/plain",
+        )
 
 # --- Chat history init ---
 if "messages" not in st.session_state:
@@ -43,10 +102,7 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
         if message["role"] == "assistant" and message.get("sources"):
-            with st.expander("Sources"):
-                for src in message["sources"]:
-                    st.markdown(f"**{src['source']}** — chunk {src['chunk_index']}")
-                    st.text(src["text"])
+            render_sources(message["sources"])
 
 # --- Chat input ---
 if prompt := st.chat_input("Ask a question about your PDF..."):
@@ -68,12 +124,8 @@ if prompt := st.chat_input("Ask a question about your PDF..."):
                     sources = data.get("sources", [])
 
                     st.write(answer)
-
                     if sources:
-                        with st.expander("Sources"):
-                            for src in sources:
-                                st.markdown(f"**{src['source']}** — chunk {src['chunk_index']}")
-                                st.text(src["text"])
+                        render_sources(sources)
 
                     st.session_state.messages.append(
                         {"role": "assistant", "content": answer, "sources": sources}

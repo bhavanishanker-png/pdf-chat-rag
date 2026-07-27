@@ -5,6 +5,7 @@ import chromadb
 import fitz  # PyMuPDF
 from groq import Groq
 import os
+import re
 from dotenv import load_dotenv
 import uuid
 
@@ -48,6 +49,28 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return chunks
 
 
+def find_highlight(chunk: str, query: str) -> str:
+    """Return the sentence in chunk with the highest word overlap with the query."""
+    sentences = re.split(r"(?<=[.!?])\s+", chunk.strip())
+    if not sentences:
+        return chunk[:200]
+    query_words = set(re.findall(r"\w+", query.lower()))
+    best, best_score = sentences[0], -1.0
+    for sentence in sentences:
+        words = set(re.findall(r"\w+", sentence.lower()))
+        if not words:
+            continue
+        score = len(query_words & words) / len(query_words | words)
+        if score > best_score:
+            best_score, best = score, sentence
+    return best
+
+
+def distance_to_pct(distance: float) -> int:
+    """Convert ChromaDB L2 distance to a 0–100 relevance percentage."""
+    return max(0, round((1 - distance / 2) * 100))
+
+
 class QueryRequest(BaseModel):
     query: str
 
@@ -56,6 +79,14 @@ class QueryRequest(BaseModel):
 def health_check():
     count = collection.count()
     return {"status": "ok", "chunks_in_db": count}
+
+
+@app.post("/clear")
+def clear_db():
+    global collection
+    chroma_client.delete_collection("pdf_chunks")
+    collection = chroma_client.get_or_create_collection("pdf_chunks")
+    return {"message": "Database cleared successfully"}
 
 
 @app.post("/ingest")
@@ -75,7 +106,6 @@ async def ingest_pdf(file: UploadFile = File(...)):
         {"source": file.filename, "chunk_index": i} for i in range(len(chunks))
     ]
 
-    # ChromaDB embeds the text locally using DefaultEmbeddingFunction
     collection.add(
         ids=ids,
         documents=chunks,
@@ -95,6 +125,7 @@ def ask_question(request: QueryRequest):
 
     docs = (results["documents"] or [[]])[0]
     metadatas = (results["metadatas"] or [[]])[0]
+    distances = (results["distances"] or [[]])[0]
 
     if not docs:
         return {"answer": "No relevant context found. Please ingest a PDF first.", "sources": []}
@@ -127,8 +158,10 @@ def ask_question(request: QueryRequest):
             "source": m["source"],
             "chunk_index": m["chunk_index"],
             "text": d[:300] + ("..." if len(d) > 300 else ""),
+            "highlight": find_highlight(d, request.query),
+            "similarity_pct": distance_to_pct(dist),
         }
-        for d, m in zip(docs, metadatas)
+        for d, m, dist in zip(docs, metadatas, distances)
     ]
 
     return {"answer": answer, "sources": sources}
