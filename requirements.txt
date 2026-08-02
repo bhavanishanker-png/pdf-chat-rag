@@ -16,4 +16,3 @@ langchain-community
 langchain-classic
 langchain-text-splitters
 langgraph
-sentence-transformers
