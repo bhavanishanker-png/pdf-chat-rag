@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: rag-backend
+    runtime: python
+    buildCommand: |
+      pip install -r requirements.txt &&
+      python -c "from langchain_huggingface import HuggingFaceEmbeddings; HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')"
+    startCommand: sh -c 'cd step3 && uvicorn backend:app --host 0.0.0.0 --port $PORT'
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
