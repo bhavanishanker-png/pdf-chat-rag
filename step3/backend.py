@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import os
 import uuid
+
 from typing import List, Literal, TypedDict
 
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
@@ -384,6 +387,15 @@ def ask_question(request: QueryRequest):
         "sources": sources,
         "steps": final_state["steps"],
     }
+
+
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+
+@app.get("/ui", include_in_schema=False)
+def serve_ui() -> FileResponse:
+    return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
 
 
 if __name__ == "__main__":
