@@ -1,19 +1,14 @@
-# RAG Tutorial — PDF Chat with Groq + ChromaDB
+# PDF RAG Chat — Corrective RAG with LangGraph
 
-A full-stack Retrieval-Augmented Generation (RAG) application that lets you upload PDF documents and chat with them using AI. Built with FastAPI, Streamlit, ChromaDB, and Groq's free LLM API.
+A production-grade Retrieval-Augmented Generation (RAG) application that lets you upload PDF documents and chat with them using AI. Built with **LangGraph**, **LangChain**, **ChromaDB**, and **Groq's free LLM API**.
 
 ---
 
 ## What is RAG?
 
-RAG (Retrieval-Augmented Generation) is a technique that grounds an LLM's answers in your own documents instead of relying on its training data alone. The flow is:
+RAG (Retrieval-Augmented Generation) grounds an LLM's answers in your own documents instead of its training data. This prevents hallucinations and makes answers citable.
 
-```
-PDF → extract text → chunk → embed → store in vector DB
-Question → BM25 + semantic search → retrieve top chunks → LLM → grounded answer
-```
-
-This prevents hallucinations and makes the AI's answers citable and verifiable.
+This app goes further with **Corrective RAG (CRAG)** — a self-correcting pipeline that grades its own retrieved documents, rewrites bad queries, and checks its own answers for hallucinations before returning them.
 
 ---
 
@@ -21,41 +16,93 @@ This prevents hallucinations and makes the AI's answers citable and verifiable.
 
 | Feature | Description |
 |---------|-------------|
-| PDF ingestion | Upload any PDF — text is extracted, chunked, embedded, and stored |
-| Hybrid search | Combines BM25 keyword search + semantic vector search via Reciprocal Rank Fusion |
-| Grounded answers | Groq `llama-3.1-8b-instant` answers strictly from your document context |
-| Source citations | Every answer shows which chunks of the PDF it came from |
-| Highlighted sentence | The most relevant sentence in each source chunk is bolded |
-| Confidence score | Each source shows a relevance % score with a visual progress bar |
-| Chunk size tuning | Sidebar sliders to adjust chunk size, overlap, and top-K at runtime |
-| Clear DB | One-click button to wipe the vector store and start fresh |
-| Download chat | Export the full conversation as a `.txt` file |
+| Corrective RAG graph | LangGraph pipeline that self-corrects — grades docs, rewrites queries, checks hallucinations |
+| Hybrid search | BM25 keyword search + semantic vector search combined via Reciprocal Rank Fusion |
+| Document grading | LLM filters irrelevant retrieved chunks before generating |
+| Query rewriting | If retrieved docs are poor, the query is automatically rewritten and retried |
+| Hallucination check | Generated answer is verified to be grounded in the retrieved context |
+| Usefulness check | Answer is verified to actually resolve the question |
+| Reasoning trace | Every step the graph took is shown in a collapsible expander |
+| Source citations | Retrieved chunks shown with page number and source file |
+| Chunk size tuning | Sidebar sliders for chunk size, overlap, and top-K at runtime |
+| Clear DB | One-click button to wipe the vector store |
+| Download chat | Export the full conversation as `.txt` |
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────┐        HTTP        ┌───────────────────────────────────┐
-│   Streamlit UI      │ ◄────────────────► │        FastAPI Backend             │
-│   (frontend.py)     │                    │        (backend.py)                │
-│                     │                    │                                    │
-│  • PDF uploader     │                    │  POST /ingest  → extract, chunk,   │
-│  • Chunk sliders    │                    │                  embed, store       │
-│  • Chat input       │                    │  POST /ask     → hybrid search,    │
-│  • Source + score   │                    │                  prompt, answer    │
-│  • Download chat    │                    │  POST /clear   → wipe ChromaDB     │
-└─────────────────────┘                    │  GET  /        → health check      │
-                                           └──────────┬────────────────────────┘
-                                                      │
-                              ┌───────────────────────┼──────────────────────┐
-                              │                       │                      │
-                    ┌─────────▼──────┐    ┌───────────▼────┐    ┌────────────▼────┐
-                    │   ChromaDB     │    │   Groq API      │    │   PyMuPDF       │
-                    │ (vector store) │    │ llama-3.1-8b    │    │ (PDF parsing)   │
-                    │  local on disk │    │  (free LLM)     │    │                 │
-                    └───────────────┘    └────────────────┘    └────────────────┘
+┌──────────────────────┐        HTTP        ┌───────────────────────────────────────┐
+│   Streamlit UI       │ ◄────────────────► │         FastAPI Backend                │
+│   (frontend.py)      │                    │         (backend.py)                   │
+│                      │                    │                                        │
+│  • PDF uploader      │                    │  POST /ingest  → extract, chunk,       │
+│  • Chunk sliders     │                    │                  embed, store           │
+│  • Chat input        │                    │  POST /ask     → LangGraph CRAG        │
+│  • Reasoning trace   │                    │  POST /clear   → wipe ChromaDB         │
+│  • Source citations  │                    │  GET  /        → health check          │
+│  • Download chat     │                    └───────────────┬───────────────────────┘
+└──────────────────────┘                                    │
+                                                            │
+                              ┌─────────────────────────────┼─────────────────────────┐
+                              │                             │                         │
+                    ┌─────────▼──────┐          ┌──────────▼──────┐       ┌──────────▼──────┐
+                    │   ChromaDB     │          │   Groq API       │       │   PyMuPDF       │
+                    │ (vector store) │          │ llama-3.1-8b     │       │ (PDF parsing)   │
+                    │  local on disk │          │  (free LLM)      │       │                 │
+                    └───────────────┘          └────────────────┘        └────────────────┘
 ```
+
+---
+
+## LangGraph Pipeline (CRAG)
+
+The core of the app is a self-correcting graph that runs on every question:
+
+```
+                    ┌─────────┐
+                    │  START  │
+                    └────┬────┘
+                         │
+                    ┌────▼────┐
+                    │retrieve │  BM25 + semantic hybrid search (EnsembleRetriever)
+                    └────┬────┘
+                         │
+               ┌─────────▼──────────┐
+               │  grade_documents   │  LLM scores each chunk for relevance
+               └─────────┬──────────┘
+                         │
+          ┌──────────────┼──────────────────┐
+          │ has docs     │ no docs           │ no docs, max retries
+          │              │ retry < 2         │
+          │        ┌─────▼──────┐           │
+          │        │rewrite_query│           │
+          │        └─────┬──────┘           │
+          │              │                  │
+          │         (loop back to retrieve) │
+          │                                 │
+          │                          ┌──────▼──────────┐
+          │                          │ no_docs_response │ → END
+          │                          └─────────────────┘
+          │
+     ┌────▼─────┐
+     │ generate │  Groq llama-3.1-8b answers from context
+     └────┬─────┘
+          │
+  ┌───────▼────────┐
+  │ check_quality  │  hallucination check + usefulness check
+  └───────┬────────┘
+          │
+     ┌────┴──────────────────┐
+     │ ok                    │ not ok, retry < 2
+     │                       │
+   ┌─▼──┐              (loop back to generate)
+   │ END│
+   └────┘
+```
+
+**Why CRAG?** A basic RAG pipeline blindly uses whatever it retrieves. CRAG grades the retrieved documents, discards irrelevant ones, rewrites the query if needed, generates an answer, and then verifies the answer isn't hallucinated — all automatically.
 
 ---
 
@@ -63,14 +110,17 @@ This prevents hallucinations and makes the AI's answers citable and verifiable.
 
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
-| Backend | FastAPI + Uvicorn | REST API server |
-| Frontend | Streamlit | Chat UI with sliders and download |
-| Vector store | ChromaDB (persistent) | Store and search embeddings |
-| Embeddings | ChromaDB DefaultEmbeddingFunction | Local, free, no API key needed |
-| Keyword search | rank-bm25 | BM25 keyword matching for exact terms |
+| Graph orchestration | LangGraph | CRAG pipeline with cycles and conditional edges |
+| LLM chains | LangChain | Graders, rewriter, RAG chain |
 | LLM | Groq — `llama-3.1-8b-instant` | Fast, free inference |
-| PDF parsing | PyMuPDF (fitz) | Extract text from PDFs |
-| Environment | python-dotenv | Load API keys from `.env` |
+| Embeddings | HuggingFace `all-MiniLM-L6-v2` | Local, free, 384-dim vectors |
+| Vector store | ChromaDB (persistent) | Store and search embeddings |
+| Keyword search | rank-bm25 via LangChain | BM25 for exact term matching |
+| Hybrid retrieval | LangChain EnsembleRetriever | RRF fusion of BM25 + semantic |
+| PDF parsing | PyMuPDF (fitz) | Page-level text extraction |
+| Text splitting | langchain-text-splitters | RecursiveCharacterTextSplitter |
+| Backend | FastAPI + Uvicorn | REST API |
+| Frontend | Streamlit | Chat UI |
 
 ---
 
@@ -79,12 +129,13 @@ This prevents hallucinations and makes the AI's answers citable and verifiable.
 ```
 RAG_Tutorial/
 ├── step3/
-│   ├── backend.py      # FastAPI app — ingest, hybrid search, ask, clear
-│   └── frontend.py     # Streamlit chat UI with sliders and UX features
+│   ├── backend.py      # FastAPI + LangGraph CRAG pipeline
+│   └── frontend.py     # Streamlit chat UI with reasoning trace
 ├── requirements.txt    # Python dependencies
 ├── .env                # API keys (not committed)
 ├── .gitignore
-├── chroma_db/          # Vector store data (auto-created, not committed)
+├── pyrightconfig.json  # Type checker config
+├── chroma_db/          # Vector store (auto-created, not committed)
 └── .venv/              # Virtual environment (not committed)
 ```
 
@@ -111,9 +162,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Add your Groq API key
+> First run downloads the `all-MiniLM-L6-v2` embedding model (~90 MB). This is a one-time download.
 
-Create a `.env` file in the project root:
+### 4. Add your Groq API key
 
 ```
 GROQ_API_KEY=your-groq-api-key-here
@@ -125,18 +176,11 @@ Get a free key at [console.groq.com/keys](https://console.groq.com/keys). No cre
 
 ## Running the App
 
-You need two terminals open at the same time.
-
 **Terminal 1 — Backend:**
 
 ```bash
 source .venv/bin/activate
 python step3/backend.py
-```
-
-You should see:
-```
-INFO: Uvicorn running on http://0.0.0.0:8000
 ```
 
 **Terminal 2 — Frontend:**
@@ -146,61 +190,19 @@ source .venv/bin/activate
 streamlit run step3/frontend.py
 ```
 
-Streamlit opens `http://localhost:8501` in your browser automatically.
+Streamlit opens `http://localhost:8501` automatically.
 
 ---
 
 ## Usage
 
-1. **Adjust settings** — use the sidebar sliders to set chunk size, overlap, and how many results to retrieve before ingesting.
-2. **Upload a PDF** — pick a file and click "Ingest PDF". The backend extracts text, splits it into overlapping chunks, embeds them locally, and stores them in ChromaDB.
-3. **Ask a question** — type in the chat box. The backend runs hybrid search (BM25 + semantic) and sends the top results as context to the LLM.
-4. **Inspect sources** — each answer shows collapsible source cards with a relevance %, a progress bar, and the most relevant sentence bolded.
-5. **Download the chat** — click "Download Chat (.txt)" in the sidebar to save the conversation.
-6. **Start over** — click "Clear DB" to wipe all stored chunks and re-ingest.
-
----
-
-## How Ingestion Works
-
-```
-PDF bytes
-   │
-   ▼ PyMuPDF
-Full text string
-   │
-   ▼ chunk_text(chunk_size, overlap) — configurable via sliders
-List of overlapping text chunks
-   │
-   ▼ ChromaDB DefaultEmbeddingFunction (all-MiniLM-L6-v2, runs locally)
-384-dimensional embeddings
-   │
-   ▼ ChromaDB PersistentClient
-Stored in ./chroma_db with metadata: {source, chunk_index, chunk_size}
-```
-
-## How Hybrid Search Works
-
-```
-User question
-   │
-   ├──────────────────────────────────┐
-   │                                  │
-   ▼ BM25Okapi (rank-bm25)            ▼ ChromaDB semantic search
-Keyword scores over all chunks     Vector similarity scores (top-K×3)
-   │                                  │
-   └──────────┬───────────────────────┘
-              │
-              ▼ Reciprocal Rank Fusion (RRF, k=60)
-Unified ranked list — exact matches + semantic matches combined
-              │
-              ▼ Top-K chunks sent as context
-              │
-              ▼ Groq API — llama-3.1-8b-instant
-Answer grounded in your PDF, with source citations
-```
-
-**Why hybrid?** Semantic search is great for meaning but misses exact terms like names, numbers, and codes. BM25 catches those precisely. RRF merges both ranked lists without needing to tune weights.
+1. **Adjust settings** — set chunk size, overlap, and top-K in the sidebar before ingesting
+2. **Upload a PDF** — pick a file and click "Ingest PDF"
+3. **Ask a question** — type in the chat box
+4. **Inspect the reasoning** — expand "Reasoning trace" to see every step the graph took
+5. **View sources** — each source shows the page number and chunk text
+6. **Download** — click "Download Chat (.txt)" to save the conversation
+7. **Start over** — click "Clear DB" to wipe all stored chunks
 
 ---
 
@@ -209,41 +211,44 @@ Answer grounded in your PDF, with source citations
 | Method | Endpoint | Params | Description |
 |--------|----------|--------|-------------|
 | GET | `/` | — | Health check — DB status and chunk count |
-| POST | `/ingest` | `chunk_size`, `chunk_overlap` (query params) | Upload and ingest a PDF |
-| POST | `/ask` | `{ query, top_k }` (JSON body) | Ask a question, get answer + sources |
-| POST | `/clear` | — | Wipe the ChromaDB collection |
+| POST | `/ingest` | `chunk_size`, `chunk_overlap` (query) | Upload and ingest a PDF |
+| POST | `/ask` | `{ query, top_k }` (JSON body) | Run CRAG pipeline, return answer + sources + steps |
+| POST | `/clear` | — | Wipe ChromaDB collection |
 
 ---
 
 ## Configuration
 
-Defaults in `step3/backend.py` (all overridable at runtime via the UI):
-
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `DEFAULT_CHUNK_SIZE` | 1000 | Characters per chunk |
-| `DEFAULT_CHUNK_OVERLAP` | 200 | Overlap between consecutive chunks |
-| `DEFAULT_TOP_K` | 5 | Number of chunks retrieved per query |
-| `model` | `llama-3.1-8b-instant` | Groq model used for answers |
+| `DEFAULT_CHUNK_OVERLAP` | 200 | Overlap between chunks |
+| `DEFAULT_TOP_K` | 5 | Chunks retrieved per query |
+| `MAX_RETRIES` | 2 | Max query rewrites / generation retries |
+| `model` | `llama-3.1-8b-instant` | Groq model |
 
 ---
 
 ## Dependencies
 
 ```
-fastapi          # Backend framework
-uvicorn          # ASGI server
-chromadb         # Vector database + local embeddings
-groq             # Groq LLM client
-pymupdf          # PDF text extraction
-rank-bm25        # BM25 keyword search
-python-dotenv    # .env file loading
-streamlit        # Frontend UI
-requests         # HTTP client for frontend → backend
-```
-
-Install all with:
-
-```bash
-pip install -r requirements.txt
+fastapi                 # Backend framework
+uvicorn                 # ASGI server
+chromadb                # Vector database
+groq                    # Groq LLM client (direct)
+pymupdf                 # PDF text extraction
+python-dotenv           # .env file loading
+streamlit               # Frontend UI
+requests                # HTTP client
+rank-bm25               # BM25 keyword search
+langchain               # LLM orchestration
+langchain-core          # Base interfaces
+langchain-groq          # Groq LLM integration
+langchain-chroma        # ChromaDB integration
+langchain-huggingface   # HuggingFace embeddings
+langchain-community     # BM25Retriever
+langchain-classic       # EnsembleRetriever
+langchain-text-splitters # RecursiveCharacterTextSplitter
+langgraph               # Graph-based pipeline orchestration
+sentence-transformers   # Local embedding model runtime
 ```

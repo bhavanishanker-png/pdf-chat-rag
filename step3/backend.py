@@ -1,19 +1,41 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import chromadb
-import fitz  # PyMuPDF
-from groq import Groq
-from rank_bm25 import BM25Okapi
+"""
+Corrective RAG (CRAG) backend using LangGraph.
+
+Graph flow:
+  retrieve → grade_documents
+    ├─ relevant docs found  ──────────────────────→ generate → check_quality
+    │                                                              ├─ ok         → END
+    │                                                              └─ retry < 2  → generate
+    └─ no relevant docs, retry < 2  → rewrite_query → retrieve
+    └─ no relevant docs, retry >= 2 → no_docs_response → END
+"""
+
+from __future__ import annotations
+
 import os
-import re
-from dotenv import load_dotenv
 import uuid
+from typing import List, Literal, TypedDict
+
+import fitz  # PyMuPDF
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
+# ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,128 +44,272 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# ── LLM ───────────────────────────────────────────────────────────────────────
+llm = ChatGroq(
+    model="llama-3.1-8b-instant",
+    api_key=os.getenv("GROQ_API_KEY"),
+    temperature=0,
+)
 
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_or_create_collection("pdf_chunks")
+# ── Embeddings + Vector Store ─────────────────────────────────────────────────
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+vectorstore = Chroma(
+    collection_name="pdf_chunks",
+    embedding_function=embeddings,
+    persist_directory="./chroma_db",
+)
 
+# ── Constants ─────────────────────────────────────────────────────────────────
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_TOP_K = 5
+MAX_RETRIES = 2
+
+# ── Structured graders ────────────────────────────────────────────────────────
+class BinaryGrade(BaseModel):
+    binary_score: Literal["yes", "no"] = Field(description="'yes' or 'no'")
+
+_doc_grader_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a relevance grader. Given a retrieved document and a user question, "
+     "output 'yes' if the document is relevant to the question, 'no' otherwise."),
+    ("human", "Document:\n{document}\n\nQuestion: {question}"),
+])
+doc_grader = _doc_grader_prompt | llm.with_structured_output(BinaryGrade)
+
+_hallucination_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a hallucination grader. Output 'yes' if the answer is fully grounded "
+     "in the provided facts, 'no' if it contains unsupported claims."),
+    ("human", "Facts:\n{documents}\n\nAnswer:\n{answer}"),
+])
+hallucination_grader = _hallucination_prompt | llm.with_structured_output(BinaryGrade)
+
+_answer_grade_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an answer grader. Output 'yes' if the answer actually resolves "
+     "the question, 'no' if it does not."),
+    ("human", "Question: {question}\n\nAnswer: {answer}"),
+])
+answer_grader = _answer_grade_prompt | llm.with_structured_output(BinaryGrade)
+
+# ── Query rewriter ────────────────────────────────────────────────────────────
+_rewrite_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a query optimizer. Rewrite the question to be clearer and more specific "
+     "for document retrieval. Return only the rewritten question."),
+    ("human", "Question: {question}"),
+])
+query_rewriter = _rewrite_prompt | llm | StrOutputParser()
+
+# ── RAG chain ─────────────────────────────────────────────────────────────────
+_rag_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a helpful assistant. Answer the question using ONLY the provided context. "
+     "If the answer is not in the context, say so clearly. Be concise and accurate."),
+    ("human", "Context:\n{context}\n\nQuestion: {question}"),
+])
+rag_chain = _rag_prompt | llm | StrOutputParser()
+
+# ── Graph State ───────────────────────────────────────────────────────────────
+class GraphState(TypedDict):
+    query: str
+    top_k: int
+    documents: List[Document]
+    answer: str
+    steps: List[str]
+    retry_count: int
+    generation_ok: bool
 
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += str(page.get_text("text"))
-    return text
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _all_langchain_docs() -> List[Document]:
+    col = vectorstore._collection  # type: ignore[union-attr]
+    result = col.get(include=["documents", "metadatas"])
+    return [
+        Document(page_content=text, metadata=meta or {})
+        for text, meta in zip(result["documents"] or [], result["metadatas"] or [])
+    ]
 
 
-def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
-    chunks = []
-    start = 0
-    while start < len(text):
-        chunks.append(text[start : start + chunk_size])
-        start += chunk_size - overlap
-    return chunks
-
-
-def tokenize(text: str) -> list[str]:
-    return re.findall(r"\w+", text.lower())
-
-
-def find_highlight(chunk: str, query: str) -> str:
-    sentences = re.split(r"(?<=[.!?])\s+", chunk.strip())
-    if not sentences:
-        return chunk[:200]
-    query_words = set(tokenize(query))
-    best, best_score = sentences[0], -1.0
-    for sentence in sentences:
-        words = set(tokenize(sentence))
-        if not words:
-            continue
-        score = len(query_words & words) / len(query_words | words)
-        if score > best_score:
-            best_score, best = score, sentence
-    return best
-
-
-def distance_to_pct(distance: float) -> int:
-    return max(0, round((1 - distance / 2) * 100))
-
-
-def hybrid_search(
-    query: str, top_k: int
-) -> tuple[list[str], list[dict], list[float]]:
-    """Combine BM25 keyword search and semantic search using Reciprocal Rank Fusion."""
-    all_data = collection.get(include=["documents", "metadatas"])  # type: ignore[list-item]
-    all_docs = all_data["documents"] or []
-    all_metas = all_data["metadatas"] or []
-    all_ids = all_data["ids"] or []
-
+def _ensemble_retriever(top_k: int) -> EnsembleRetriever | None:
+    all_docs = _all_langchain_docs()
     if not all_docs:
-        return [], [], []
-
-    n_candidates = min(top_k * 3, len(all_docs))
-
-    # --- BM25 ---
-    bm25 = BM25Okapi([tokenize(d) for d in all_docs])
-    bm25_scores = bm25.get_scores(tokenize(query))
-    bm25_top_idx = bm25_scores.argsort()[::-1][:n_candidates]
-    bm25_ranks: dict[str, int] = {all_ids[i]: rank for rank, i in enumerate(bm25_top_idx)}
-
-    # --- Semantic ---
-    sem = collection.query(
-        query_texts=[query],
-        n_results=n_candidates,
-        include=["documents", "metadatas", "distances"],
+        return None
+    bm25 = BM25Retriever.from_documents(all_docs, k=top_k)
+    semantic = vectorstore.as_retriever(search_kwargs={"k": top_k})
+    return EnsembleRetriever(
+        retrievers=[bm25, semantic],
+        weights=[0.4, 0.6],
     )
-    sem_ids: list[str] = (sem["ids"] or [[]])[0]  # type: ignore[index]
-    sem_distances: list[float] = (sem["distances"] or [[]])[0]
-    sem_ranks: dict[str, int] = {doc_id: rank for rank, doc_id in enumerate(sem_ids)}
-    sem_dist_map: dict[str, float] = dict(zip(sem_ids, sem_distances))
 
-    # --- Reciprocal Rank Fusion ---
-    k = 60
-    all_candidate_ids = set(bm25_ranks) | set(sem_ranks)
-    rrf_scores: dict[str, float] = {
-        doc_id: (1 / (k + bm25_ranks[doc_id] + 1) if doc_id in bm25_ranks else 0)
-        + (1 / (k + sem_ranks[doc_id] + 1) if doc_id in sem_ranks else 0)
-        for doc_id in all_candidate_ids
+
+def _docs_as_text(docs: List[Document]) -> str:
+    return "\n\n".join(d.page_content for d in docs)
+
+
+# ── Graph nodes ───────────────────────────────────────────────────────────────
+def retrieve(state: GraphState) -> GraphState:
+    retriever = _ensemble_retriever(state["top_k"])
+    if retriever is None:
+        return {**state, "documents": [],
+                "steps": state["steps"] + ["Retrieval: database is empty"]}
+    docs = retriever.invoke(state["query"])
+    return {
+        **state,
+        "documents": docs,
+        "steps": state["steps"] + [f"Retrieved {len(docs)} chunks (BM25 + semantic hybrid)"],
     }
-    top_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:top_k]
 
-    id_to_data = {
-        doc_id: (doc, meta)
-        for doc_id, doc, meta in zip(all_ids, all_docs, all_metas)
+
+def grade_documents(state: GraphState) -> GraphState:
+    filtered: List[Document] = []
+    for doc in state["documents"]:
+        score: BinaryGrade = doc_grader.invoke({  # type: ignore[assignment]
+            "document": doc.page_content[:1000],
+            "question": state["query"],
+        })
+        if score.binary_score == "yes":
+            filtered.append(doc)
+    kept, total = len(filtered), len(state["documents"])
+    return {
+        **state,
+        "documents": filtered,
+        "steps": state["steps"] + [f"Document grading: {kept}/{total} relevant"],
     }
-    result_docs, result_metas, result_dists = [], [], []
-    for doc_id in top_ids:
-        doc, meta = id_to_data[doc_id]
-        result_docs.append(doc)
-        result_metas.append(meta)
-        result_dists.append(sem_dist_map.get(doc_id, 1.0))
-
-    return result_docs, result_metas, result_dists
 
 
+def rewrite_query(state: GraphState) -> GraphState:
+    new_q = query_rewriter.invoke({"question": state["query"]})
+    return {
+        **state,
+        "query": new_q,
+        "retry_count": state["retry_count"] + 1,
+        "steps": state["steps"] + [f'Query rewritten → "{new_q}"'],
+    }
+
+
+def no_docs_response(state: GraphState) -> GraphState:
+    return {
+        **state,
+        "answer": "I could not find relevant information in the document to answer your question.",
+        "steps": state["steps"] + ["No relevant documents found after retries — giving up"],
+    }
+
+
+def generate(state: GraphState) -> GraphState:
+    answer = rag_chain.invoke({
+        "context": _docs_as_text(state["documents"]),
+        "question": state["query"],
+    })
+    return {
+        **state,
+        "answer": answer,
+        "retry_count": state["retry_count"] + 1,
+        "steps": state["steps"] + ["Generated answer from context"],
+    }
+
+
+def check_quality(state: GraphState) -> GraphState:
+    docs_text = _docs_as_text(state["documents"])
+
+    h_score: BinaryGrade = hallucination_grader.invoke({  # type: ignore[assignment]
+        "documents": docs_text,
+        "answer": state["answer"],
+    })
+    grounded = h_score.binary_score == "yes"
+
+    if grounded:
+        a_score: BinaryGrade = answer_grader.invoke({  # type: ignore[assignment]
+            "question": state["query"],
+            "answer": state["answer"],
+        })
+        useful = a_score.binary_score == "yes"
+        ok = grounded and useful
+        label = "grounded + useful" if ok else "grounded but incomplete"
+    else:
+        ok = False
+        label = "hallucination detected — will retry" if state["retry_count"] < MAX_RETRIES else "hallucination detected — max retries reached"
+
+    return {
+        **state,
+        "generation_ok": ok,
+        "steps": state["steps"] + [f"Quality check: {label}"],
+    }
+
+
+# ── Conditional edges ─────────────────────────────────────────────────────────
+def after_grading(state: GraphState) -> Literal["generate", "rewrite_query", "no_docs_response"]:
+    if state["documents"]:
+        return "generate"
+    if state["retry_count"] < MAX_RETRIES:
+        return "rewrite_query"
+    return "no_docs_response"
+
+
+def after_quality_check(state: GraphState) -> Literal["end", "generate"]:
+    if state["generation_ok"]:
+        return "end"
+    if state["retry_count"] < MAX_RETRIES:
+        return "generate"
+    return "end"
+
+
+# ── Build + compile graph ─────────────────────────────────────────────────────
+def _build_graph():
+    g = StateGraph(GraphState)  # type: ignore[arg-type]
+
+    g.add_node("retrieve", retrieve)
+    g.add_node("grade_documents", grade_documents)
+    g.add_node("rewrite_query", rewrite_query)
+    g.add_node("no_docs_response", no_docs_response)
+    g.add_node("generate", generate)
+    g.add_node("check_quality", check_quality)
+
+    g.set_entry_point("retrieve")
+    g.add_edge("retrieve", "grade_documents")
+    g.add_conditional_edges(
+        "grade_documents", after_grading,
+        {"generate": "generate", "rewrite_query": "rewrite_query", "no_docs_response": "no_docs_response"},
+    )
+    g.add_edge("rewrite_query", "retrieve")
+    g.add_edge("no_docs_response", END)
+    g.add_edge("generate", "check_quality")
+    g.add_conditional_edges(
+        "check_quality", after_quality_check,
+        {"end": END, "generate": "generate"},
+    )
+
+    return g.compile()
+
+
+rag_graph = _build_graph()
+
+
+# ── FastAPI request schemas ───────────────────────────────────────────────────
 class QueryRequest(BaseModel):
     query: str
     top_k: int = DEFAULT_TOP_K
 
 
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def health_check():
-    count = collection.count()
+    count = vectorstore._collection.count()  # type: ignore[union-attr]
     return {"status": "ok", "chunks_in_db": count}
 
 
 @app.post("/clear")
 def clear_db():
-    global collection
-    chroma_client.delete_collection("pdf_chunks")
-    collection = chroma_client.get_or_create_collection("pdf_chunks")
+    global vectorstore
+    import chromadb as _chromadb
+    client = _chromadb.PersistentClient(path="./chroma_db")
+    client.delete_collection("pdf_chunks")
+    vectorstore = Chroma(
+        collection_name="pdf_chunks",
+        embedding_function=embeddings,
+        persist_directory="./chroma_db",
+    )
     return {"message": "Database cleared successfully"}
 
 
@@ -157,23 +323,30 @@ async def ingest_pdf(
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     pdf_bytes = await file.read()
-    text = extract_text_from_pdf(pdf_bytes)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    if not text.strip():
+    pages: List[Document] = []
+    for i in range(len(doc)):  # type: ignore[arg-type]
+        page = doc[i]
+        text = str(page.get_text("text")).strip()
+        if text:
+            pages.append(Document(
+                page_content=text,
+                metadata={"source": file.filename, "page": i},
+            ))
+
+    if not pages:
         raise HTTPException(status_code=400, detail="No text could be extracted from the PDF")
 
-    chunks = chunk_text(text, chunk_size, chunk_overlap)
-    ids = [str(uuid.uuid4()) for _ in chunks]
-    metadatas: list[dict[str, str | int | float | bool | None]] = [
-        {"source": file.filename, "chunk_index": i, "chunk_size": chunk_size}
-        for i in range(len(chunks))
-    ]
-
-    collection.add(
-        ids=ids,
-        documents=chunks,
-        metadatas=metadatas,  # type: ignore[arg-type]
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
     )
+    chunks = splitter.split_documents(pages)
+    for i, chunk in enumerate(chunks):
+        chunk.metadata["chunk_index"] = i
+
+    vectorstore.add_documents(chunks, ids=[str(uuid.uuid4()) for _ in chunks])
 
     return {
         "message": f"Ingested {len(chunks)} chunks from '{file.filename}'",
@@ -184,46 +357,33 @@ async def ingest_pdf(
 
 @app.post("/ask")
 def ask_question(request: QueryRequest):
-    docs, metadatas, distances = hybrid_search(request.query, request.top_k)
-
-    if not docs:
-        return {"answer": "No relevant context found. Please ingest a PDF first.", "sources": []}
-
-    context = "\n\n".join(
-        f"[{m['source']}, chunk {m['chunk_index']}]: {d}"
-        for d, m in zip(docs, metadatas)
+    initial_state = GraphState(
+        query=request.query,
+        top_k=request.top_k,
+        documents=[],
+        answer="",
+        steps=[],
+        retry_count=0,
+        generation_ok=False,
     )
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant. Answer the user's question based solely on "
-                    "the provided context. If the answer is not in the context, say so clearly."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {request.query}",
-            },
-        ],
-    )
+    final_state = rag_graph.invoke(initial_state)
 
-    answer = response.choices[0].message.content
     sources = [
         {
-            "source": m["source"],
-            "chunk_index": m["chunk_index"],
-            "text": d[:300] + ("..." if len(d) > 300 else ""),
-            "highlight": find_highlight(d, request.query),
-            "similarity_pct": distance_to_pct(dist),
+            "source": doc.metadata.get("source", "unknown"),
+            "page": doc.metadata.get("page", "?"),
+            "chunk_index": doc.metadata.get("chunk_index", "?"),
+            "text": doc.page_content[:300] + ("..." if len(doc.page_content) > 300 else ""),
         }
-        for d, m, dist in zip(docs, metadatas, distances)
+        for doc in final_state["documents"]
     ]
 
-    return {"answer": answer, "sources": sources}
+    return {
+        "answer": final_state["answer"],
+        "sources": sources,
+        "steps": final_state["steps"],
+    }
 
 
 if __name__ == "__main__":
