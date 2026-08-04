@@ -1,3 +1,13 @@
+---
+title: PDF RAG Chat
+emoji: 📄
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # PDF RAG Chat — Corrective RAG with LangGraph
 
 A full-stack AI-powered document chat application that lets you upload PDF files and ask questions about their content. Built with **FastAPI**, **LangGraph**, **ChromaDB**, **Next.js**, and **Groq's free LLM API**.

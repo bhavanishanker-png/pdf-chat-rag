@@ -33,7 +33,7 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
-from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
@@ -57,10 +57,7 @@ llm = ChatGroq(
 )
 
 # ── Embeddings + Vector Store ─────────────────────────────────────────────────
-embeddings = HuggingFaceInferenceAPIEmbeddings(
-    api_key=os.getenv("HF_TOKEN", ""),
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-)
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 vectorstore = Chroma(
     collection_name="pdf_chunks",
     embedding_function=embeddings,
