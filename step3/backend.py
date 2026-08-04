@@ -21,8 +21,6 @@ import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
@@ -31,7 +29,7 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
@@ -55,9 +53,9 @@ llm = ChatGroq(
 )
 
 # ── Embeddings + Vector Store ─────────────────────────────────────────────────
-embeddings = HuggingFaceEndpointEmbeddings(
-    model="sentence-transformers/all-MiniLM-L6-v2",
-    huggingfacehub_api_token=os.getenv("HF_TOKEN", ""),
+embeddings = HuggingFaceInferenceAPIEmbeddings(
+    api_key=os.getenv("HF_TOKEN", ""),
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
 )
 vectorstore = Chroma(
     collection_name="pdf_chunks",
@@ -391,14 +389,6 @@ def ask_question(request: QueryRequest):
         "steps": final_state["steps"],
     }
 
-
-_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
-
-
-@app.get("/ui", include_in_schema=False)
-def serve_ui() -> FileResponse:
-    return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
 
 
 if __name__ == "__main__":
