@@ -12,8 +12,12 @@ Graph flow:
 
 from __future__ import annotations
 
+import logging
 import os
+import traceback
 import uuid
+
+logging.basicConfig(level=logging.INFO)
 
 from typing import List, Literal, TypedDict
 
@@ -326,37 +330,43 @@ async def ingest_pdf(
     if not file.filename or not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    pdf_bytes = await file.read()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        pdf_bytes = await file.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    pages: List[Document] = []
-    for i in range(len(doc)):  # type: ignore[arg-type]
-        page = doc[i]
-        text = str(page.get_text("text")).strip()
-        if text:
-            pages.append(Document(
-                page_content=text,
-                metadata={"source": file.filename, "page": i},
-            ))
+        pages: List[Document] = []
+        for i in range(len(doc)):  # type: ignore[arg-type]
+            page = doc[i]
+            text = str(page.get_text("text")).strip()
+            if text:
+                pages.append(Document(
+                    page_content=text,
+                    metadata={"source": file.filename, "page": i},
+                ))
 
-    if not pages:
-        raise HTTPException(status_code=400, detail="No text could be extracted from the PDF")
+        if not pages:
+            raise HTTPException(status_code=400, detail="No text could be extracted from the PDF")
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
-    chunks = splitter.split_documents(pages)
-    for i, chunk in enumerate(chunks):
-        chunk.metadata["chunk_index"] = i
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        chunks = splitter.split_documents(pages)
+        for i, chunk in enumerate(chunks):
+            chunk.metadata["chunk_index"] = i
 
-    vectorstore.add_documents(chunks, ids=[str(uuid.uuid4()) for _ in chunks])
+        vectorstore.add_documents(chunks, ids=[str(uuid.uuid4()) for _ in chunks])
 
-    return {
-        "message": f"Ingested {len(chunks)} chunks from '{file.filename}'",
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-    }
+        return {
+            "message": f"Ingested {len(chunks)} chunks from '{file.filename}'",
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("Ingest failed: %s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ask")
